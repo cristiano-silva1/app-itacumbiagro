@@ -27,7 +27,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     init {
         // Carregamento Assíncrono para evitar travamento da Main Thread
         viewModelScope.launch {
-            val initialFarms = AppDatabaseManager.loadFarmsAsync(context)
+            val initialFarms = AppDatabaseManager.loadFarmsAsync(context).filterNot { it.isDiagnostic() }
+            farms.clear()
             farms.addAll(initialFarms)
 
             val initialUsers = AppDatabaseManager.loadUsersAsync(context)
@@ -93,17 +94,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // 1. Sincronizar Fazendas
                 val farmsResult = NetworkModule.supabaseRepository.fetchFarms()
                 if (farmsResult.isSuccess) {
-                    val remoteFarms = farmsResult.getOrNull().orEmpty()
+                    val remoteFarms = farmsResult.getOrNull().orEmpty().filterNot { it.isDiagnostic() }
+                    
+                    // Limpar qualquer fazenda de teste/diagnóstico que tenha ficado na memória
+                    farms.removeAll { it.isDiagnostic() }
+
                     if (remoteFarms.isNotEmpty()) {
                         remoteFarms.forEach { rf ->
                             if (farms.none { it.name.equals(rf.name, ignoreCase = true) }) {
                                 farms.add(rf)
                             }
                         }
-                        AppDatabaseManager.saveFarmsAsync(context, farms)
                     }
+                    AppDatabaseManager.saveFarmsAsync(context, farms)
+
                     val pendingFarms = farms.filter { lf ->
-                        remoteFarms.none { it.name.equals(lf.name, ignoreCase = true) }
+                        !lf.isDiagnostic() && remoteFarms.none { it.name.equals(lf.name, ignoreCase = true) }
                     }
                     for (f in pendingFarms) {
                         val res = NetworkModule.supabaseRepository.upsertFarm(f)
@@ -111,6 +117,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             hasRlsWarning = true
                         }
                     }
+
+                    // Tenta garantir que qualquer registro residual de diagnóstico no Supabase seja excluído
+                    try {
+                        NetworkModule.supabaseRepository.deleteFarm("__diagnostico__")
+                    } catch (_: Exception) {}
                 }
 
                 // 2. Sincronizar Usuários

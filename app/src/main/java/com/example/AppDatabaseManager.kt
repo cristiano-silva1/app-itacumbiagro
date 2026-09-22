@@ -95,18 +95,22 @@ object AppDatabaseManager {
         return try {
             val array = JSONArray(jsonString)
             val list = mutableListOf<Farm>()
+            var hadDiagnostic = false
             for (i in 0 until array.length()) {
                 val obj = array.getJSONObject(i)
-                list.add(
-                    Farm(
-                        id = obj.getString("id"),
-                        name = obj.getString("name"),
-                        region = obj.getString("region")
-                    )
+                val farm = Farm(
+                    id = obj.getString("id"),
+                    name = obj.getString("name"),
+                    region = obj.getString("region")
                 )
+                if (farm.isDiagnostic()) {
+                    hadDiagnostic = true
+                } else {
+                    list.add(farm)
+                }
             }
             val mergedList = list.toMutableList()
-            var modified = false
+            var modified = hadDiagnostic
             for (defFarm in initialFarms) {
                 val existing = mergedList.find { it.name.equals(defFarm.name, ignoreCase = true) }
                 if (existing == null) {
@@ -125,9 +129,10 @@ object AppDatabaseManager {
     }
 
     fun saveFarms(context: Context, farms: List<Farm>) {
+        val cleanFarms = farms.filterNot { it.isDiagnostic() }
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val array = JSONArray()
-        for (f in farms) {
+        for (f in cleanFarms) {
             val obj = JSONObject().apply {
                 put("id", f.id)
                 put("name", f.name)

@@ -90,7 +90,8 @@ FOR EACH ROW EXECUTE FUNCTION log_rainfall_changes();"""
         try {
             val response = api.fetchFarms()
             if (response.isSuccessful) {
-                Result.success(response.body() ?: emptyList())
+                val cleanList = (response.body() ?: emptyList()).filterNot { it.isDiagnostic() }
+                Result.success(cleanList)
             } else {
                 Result.failure(Exception("Supabase HTTP ${response.code()}: ${response.errorBody()?.string()}"))
             }
@@ -101,6 +102,9 @@ FOR EACH ROW EXECUTE FUNCTION log_rainfall_changes();"""
     }
 
     suspend fun upsertFarm(farm: Farm): Result<Unit> = withContext(Dispatchers.IO) {
+        if (farm.isDiagnostic()) {
+            return@withContext Result.success(Unit) // Nunca sincroniza fazenda de diagnóstico para o Supabase
+        }
         try {
             val response = api.upsertFarm(farm = farm)
             if (response.isSuccessful) {

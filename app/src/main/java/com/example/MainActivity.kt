@@ -99,6 +99,12 @@ data class Farm(
     @Json(name = "region") val region: String = ""
 )
 
+fun Farm.isDiagnostic(): Boolean =
+    id == "probe-diag" ||
+    name.equals("__diagnostico__", ignoreCase = true) ||
+    name.startsWith("__diag", ignoreCase = true)
+
+
 @JsonClass(generateAdapter = true)
 data class RainfallLog(
     @Json(name = "id") val id: String = UUID.randomUUID().toString(),
@@ -143,7 +149,7 @@ class MainActivity : ComponentActivity() {
         
         if (currentUser == null) {
           LoginScreen(
-            availableFarms = farms,
+            availableFarms = farms.filterNot { it.isDiagnostic() },
             users = users,
             onLoginSuccess = { user ->
               currentUser = user
@@ -265,20 +271,22 @@ fun ItacumbiAgroApp(
 
   var activeUser by remember(currentUser) { mutableStateOf(currentUser) }
 
-  // Filtrar fazendas permitidas de acordo com o perfil de acesso
+  // Filtrar fazendas permitidas de acordo com o perfil de acesso (ignorando diagnósticos de teste)
   val accessibleFarms = remember(activeUser, farms.toList()) {
+    val cleanFarms = farms.filterNot { it.isDiagnostic() }
     if (activeUser.role == UserRole.GERENCIAL) {
-      farms.toList()
+      cleanFarms
     } else {
-      farms.filter { it.name == activeUser.assignedFarmName }
+      cleanFarms.filter { it.name == activeUser.assignedFarmName }
     }
   }
 
   var selectedFarm by remember(activeUser, farms.toList()) {
+    val cleanFarms = farms.filterNot { it.isDiagnostic() }
     val initial = if (activeUser.role == UserRole.FAZENDA) {
-      farms.firstOrNull { it.name == activeUser.assignedFarmName } ?: farms.firstOrNull() ?: Farm("", "", "")
+      cleanFarms.firstOrNull { it.name == activeUser.assignedFarmName } ?: cleanFarms.firstOrNull() ?: Farm("", "", "")
     } else {
-      farms.firstOrNull() ?: Farm("", "", "")
+      cleanFarms.firstOrNull() ?: Farm("", "", "")
     }
     mutableStateOf(initial)
   }
