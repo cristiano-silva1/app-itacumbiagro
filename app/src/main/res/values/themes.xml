@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MyApplication" parent="android:Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:colorPrimary">#16A34A</item>
+        <item name="android:colorAccent">#16A34A</item>
+        <item name="android:textColorPrimary">#111827</item>
+        <item name="android:datePickerDialogTheme">@style/CustomDatePickerTheme</item>
+    </style>
+
+    <style name="CustomDatePickerTheme" parent="android:Theme.DeviceDefault.Light.Dialog">
+        <item name="android:colorPrimary">#16A34A</item>
+        <item name="android:colorAccent">#16A34A</item>
+        <item name="android:textColorPrimary">#111827</item>
+        <item name="android:windowBackground">#FFFFFF</item>
+    </style>
+</resources>
