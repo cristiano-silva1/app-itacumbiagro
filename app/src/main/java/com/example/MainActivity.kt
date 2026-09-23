@@ -84,12 +84,7 @@ data class UserAccount(
 )
 
 val defaultUsers = listOf(
-    UserAccount("gerente", "1234", "Diretoria Agro (Gerencial)", UserRole.GERENCIAL, null),
-    UserAccount("primavera", "1234", "Operador Primavera", UserRole.FAZENDA, "Fazenda Primavera"),
-    UserAccount("belavista", "1234", "Operador Bela Vista", UserRole.FAZENDA, "Fazenda Bela Vista"),
-    UserAccount("saojoao", "1234", "Operador São João", UserRole.FAZENDA, "Sítio São João"),
-    UserAccount("lambari", "1234", "Operador Lambari", UserRole.FAZENDA, "Fazenda Lambari"),
-    UserAccount("santamaria", "1234", "Operador Santa Maria", UserRole.FAZENDA, "Fazenda Santa Maria")
+    UserAccount("gerente", "1234", "Diretoria Agro (Gerencial)", UserRole.GERENCIAL, null)
 )
 
 @JsonClass(generateAdapter = true)

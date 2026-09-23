@@ -10,13 +10,7 @@ object AppDatabaseManager {
     private const val KEY_FARMS = "db_farms"
     private const val KEY_LOGS = "db_logs"
 
-    val initialFarms = listOf(
-        Farm("1", "Fazenda Primavera", "Mato Grosso"),
-        Farm("2", "Fazenda Bela Vista", "Mato Grosso do Sul"),
-        Farm("3", "Sítio São João", "Goiás"),
-        Farm("4", "Fazenda Lambari", "Mato Grosso do Sul"),
-        Farm("5", "Fazenda Santa Maria", "Mato Grosso do Sul")
-    )
+    val initialFarms = emptyList<Farm>()
 
     fun loadUsers(context: Context): List<UserAccount> {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
