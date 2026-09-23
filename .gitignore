@@ -17,3 +17,5 @@ local.properties
 .env
 debug.keystore
 *.apk
+*.jks
+*.idsig

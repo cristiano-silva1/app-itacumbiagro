@@ -25,11 +25,13 @@ android {
 
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
+      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/itacumbi-release.jks"
       storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      storePassword = System.getenv("STORE_PASSWORD") ?: "itacumbi123"
+      keyAlias = System.getenv("KEY_ALIAS") ?: "itacumbi"
+      keyPassword = System.getenv("KEY_PASSWORD") ?: "itacumbi123"
+      enableV1Signing = true
+      enableV2Signing = true
     }
   }
 
