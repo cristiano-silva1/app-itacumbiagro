@@ -113,12 +113,23 @@ data class RainfallLog(
 )
 
 fun parseDateToComparableLong(dateStr: String): Long {
-    val parts = dateStr.trim().split("/")
-    if (parts.size >= 3) {
-        val d = parts[0].trim().toIntOrNull() ?: 0
-        val m = parts[1].trim().toIntOrNull() ?: 0
-        val y = parts[2].trim().toIntOrNull() ?: 0
-        return y * 10000L + m * 100L + d
+    val clean = dateStr.trim()
+    if (clean.contains("/")) {
+        val parts = clean.split("/")
+        if (parts.size >= 3) {
+            val d = parts[0].trim().toIntOrNull() ?: 0
+            val m = parts[1].trim().toIntOrNull() ?: 0
+            val y = parts[2].trim().toIntOrNull() ?: 0
+            return y * 10000L + m * 100L + d
+        }
+    } else if (clean.contains("-")) {
+        val parts = clean.split("-")
+        if (parts.size >= 3) {
+            val y = parts[0].trim().toIntOrNull() ?: 0
+            val m = parts[1].trim().toIntOrNull() ?: 0
+            val d = parts[2].trim().toIntOrNull() ?: 0
+            return y * 10000L + m * 100L + d
+        }
     }
     return 0L
 }
@@ -276,7 +287,7 @@ fun ItacumbiAgroApp(
     }
   }
 
-  var selectedFarm by remember(activeUser, farms.toList()) {
+  var selectedFarm by remember(activeUser) {
     val cleanFarms = farms.filterNot { it.isDiagnostic() }
     val initial = if (activeUser.role == UserRole.FAZENDA) {
       cleanFarms.firstOrNull { it.name == activeUser.assignedFarmName } ?: cleanFarms.firstOrNull() ?: Farm("", "", "")
@@ -284,6 +295,22 @@ fun ItacumbiAgroApp(
       cleanFarms.firstOrNull() ?: Farm("", "", "")
     }
     mutableStateOf(initial)
+  }
+
+  // Preserva a seleção da fazenda mesmo quando a sincronização de fundo recarrega as fazendas
+  LaunchedEffect(accessibleFarms) {
+    if (accessibleFarms.isNotEmpty()) {
+      val stillExists = accessibleFarms.find { it.id == selectedFarm.id || it.name == selectedFarm.name }
+      if (stillExists != null) {
+        if (selectedFarm != stillExists) selectedFarm = stillExists
+      } else {
+        selectedFarm = if (activeUser.role == UserRole.FAZENDA) {
+          accessibleFarms.firstOrNull { it.name == activeUser.assignedFarmName } ?: accessibleFarms.first()
+        } else {
+          accessibleFarms.first()
+        }
+      }
+    }
   }
 
   val coroutineScope = rememberCoroutineScope()
@@ -612,9 +639,12 @@ fun ItacumbiAgroApp(
             OutlinedTextField(
               value = selectedDateString,
               onValueChange = { selectedDateString = it },
+              readOnly = true,
               label = { Text("Data (DD/MM/AAAA)", color = BrandTextPrimary) },
               colors = dialogTextFieldColors,
-              modifier = Modifier.fillMaxWidth(),
+              modifier = Modifier
+                .fillMaxWidth()
+                .clickable { openDatePicker() },
               trailingIcon = {
                 IconButton(onClick = openDatePicker) {
                   Icon(Icons.Filled.DateRange, contentDescription = "Abrir Calendário", tint = BrandGreen)
@@ -689,6 +719,11 @@ fun ItacumbiAgroApp(
         Button(
           enabled = !isSavingLog,
           onClick = {
+            val dateClean = selectedDateString.trim()
+            if (!dateClean.matches(Regex("""^\d{2}/\d{2}/\d{4}$"""))) {
+              Toast.makeText(context, "Selecione uma data válida no formato DD/MM/AAAA", Toast.LENGTH_SHORT).show()
+              return@Button
+            }
             isSavingLog = true
             coroutineScope.launch {
               delay(300)
@@ -975,9 +1010,12 @@ fun ItacumbiAgroApp(
             OutlinedTextField(
               value = editDateString,
               onValueChange = { editDateString = it },
+              readOnly = true,
               label = { Text("Data (DD/MM/AAAA)", color = BrandTextPrimary) },
               colors = dialogTextFieldColors,
-              modifier = Modifier.fillMaxWidth(),
+              modifier = Modifier
+                .fillMaxWidth()
+                .clickable { openEditDatePicker() },
               trailingIcon = {
                 IconButton(onClick = openEditDatePicker) {
                   Icon(Icons.Filled.DateRange, contentDescription = "Calendário", tint = BrandGreen)
@@ -1053,6 +1091,11 @@ fun ItacumbiAgroApp(
         Button(
           enabled = !isSavingEdit,
           onClick = {
+            val dateClean = editDateString.trim()
+            if (!dateClean.matches(Regex("""^\d{2}/\d{2}/\d{4}$"""))) {
+              Toast.makeText(context, "Selecione uma data válida no formato DD/MM/AAAA", Toast.LENGTH_SHORT).show()
+              return@Button
+            }
             isSavingEdit = true
             coroutineScope.launch {
               delay(200)
@@ -1651,8 +1694,14 @@ fun ItacumbiAgroApp(
                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                       onClick = {
-                        users.removeIf { it.username == targetUser.username }
-                        coroutineScope.launch { AppDatabaseManager.saveUsersAsync(context, users.toList()) }
+                        val usernameToDelete = targetUser.username
+                        users.removeIf { it.username.equals(usernameToDelete, ignoreCase = true) }
+                        coroutineScope.launch {
+                          AppDatabaseManager.saveUsersAsync(context, users.toList())
+                          launch {
+                            NetworkModule.supabaseRepository.deleteUser(usernameToDelete)
+                          }
+                        }
                         Toast.makeText(context, "Usuário excluído com sucesso", Toast.LENGTH_SHORT).show()
                         showEditUserDialog = false
                       },
@@ -1714,6 +1763,9 @@ fun ItacumbiAgroApp(
 
               // Sincroniza usuário atualizado no Supabase
               launch {
+                if (!cleanUser.equals(targetUser.username, ignoreCase = true)) {
+                  NetworkModule.supabaseRepository.deleteUser(targetUser.username)
+                }
                 NetworkModule.supabaseRepository.upsertUser(updated)
               }
 
@@ -2592,13 +2644,16 @@ fun LogsTab(
         if (years.isEmpty()) listOf(Calendar.getInstance().get(Calendar.YEAR).toString()) else years
     }
 
+    val currentSystemYear = remember { Calendar.getInstance().get(Calendar.YEAR).toString() }
+    val currentSystemMonth = remember { String.format(Locale.US, "%02d", Calendar.getInstance().get(Calendar.MONTH) + 1) }
+
     // Filters state
-    var selectedYear by remember { mutableStateOf(availableYears.firstOrNull() ?: "2026") }
+    var selectedYear by remember { mutableStateOf(availableYears.firstOrNull() ?: currentSystemYear) }
 
     // Sync selected year if logs change (e.g. switching farm)
     LaunchedEffect(availableYears) {
         if (selectedYear !in availableYears) {
-            selectedYear = availableYears.firstOrNull() ?: "2026"
+            selectedYear = availableYears.firstOrNull() ?: currentSystemYear
         }
     }
 
@@ -2615,7 +2670,7 @@ fun LogsTab(
 
     // null = "Todos os Meses"
     var selectedMonthNum by remember { 
-        mutableStateOf<String?>(availableMonthsInSelectedYear.lastOrNull() ?: "09") 
+        mutableStateOf<String?>(availableMonthsInSelectedYear.lastOrNull() ?: currentSystemMonth) 
     }
 
     // Sync selected month when year/farm changes
@@ -3068,9 +3123,9 @@ fun StatsTab(logs: List<RainfallLog>) {
         }
     }
 
-    var selectedIndex by remember { mutableStateOf<Int?>(null) }
-    var accSelectedIndex by remember { mutableStateOf<Int?>(null) }
-    var selectedYearFilter by remember { mutableStateOf<String?>(null) }
+    var selectedIndex by remember(logs) { mutableStateOf<Int?>(null) }
+    var accSelectedIndex by remember(logs) { mutableStateOf<Int?>(null) }
+    var selectedYearFilter by remember(logs) { mutableStateOf<String?>(null) }
     
     // Determine effective selected index: priority to selectedIndex (monthly/table), fallback to accSelectedIndex
     val activeIndex = selectedIndex ?: accSelectedIndex
@@ -3261,8 +3316,8 @@ fun StatsTab(logs: List<RainfallLog>) {
 fun SectionHeader(
     title: String, 
     showLegend: Boolean = true,
-    currentYearTag: String = "2026",
-    previousYearTag: String = "2025",
+    currentYearTag: String = Calendar.getInstance().get(Calendar.YEAR).toString(),
+    previousYearTag: String = (Calendar.getInstance().get(Calendar.YEAR) - 1).toString(),
     selectedYearFilter: String? = null,
     hasComparison: Boolean = true,
     onSelectYear: ((String) -> Unit)? = null
@@ -3382,8 +3437,8 @@ fun InteractiveComparisonChart(
     selectedIndex: Int?,
     onSelect: (Int) -> Unit,
     selectedYearFilter: String? = null,
-    currentYearTag: String = "2026",
-    previousYearTag: String = "2025",
+    currentYearTag: String = Calendar.getInstance().get(Calendar.YEAR).toString(),
+    previousYearTag: String = (Calendar.getInstance().get(Calendar.YEAR) - 1).toString(),
     hasComparison: Boolean = true
 ) {
     val maxVal = data.maxOfOrNull { if (hasComparison) maxOf(it.currentYear, it.previousYear) else it.currentYear }?.coerceAtLeast(1f) ?: 1f
@@ -3728,8 +3783,8 @@ fun ComparisonTable(
     selectedIndex: Int?,
     onSelect: ((Int) -> Unit)? = null,
     selectedYearFilter: String? = null,
-    currentYearTag: String = "2026",
-    previousYearTag: String = "2025",
+    currentYearTag: String = Calendar.getInstance().get(Calendar.YEAR).toString(),
+    previousYearTag: String = (Calendar.getInstance().get(Calendar.YEAR) - 1).toString(),
     hasComparison: Boolean = true,
     isAccumulated: Boolean = false
 ) {
@@ -4528,10 +4583,10 @@ fun ModernFarmSelector(
 fun ModernKpiRow(
     totalVolume: Double, 
     rainyDays: Int,
-    monthLabel: String = "SET",
+    monthLabel: String = "MÊS",
     previousYearVolume: Double? = null,
-    currentYearTag: String = "2026",
-    previousYearTag: String = "2025",
+    currentYearTag: String = Calendar.getInstance().get(Calendar.YEAR).toString(),
+    previousYearTag: String = (Calendar.getInstance().get(Calendar.YEAR) - 1).toString(),
     hasComparison: Boolean = true,
     totalYearVolume: Double? = null
 ) {

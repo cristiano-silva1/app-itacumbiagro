@@ -61,13 +61,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 var hasRlsWarning = false
 
-                // 1. Sincronizar Fazendas (espelha a lista remota do Supabase)
+                // 1. Sincronizar Fazendas (espelha a lista remota do Supabase e sobe criadas offline)
                 val farmsResult = NetworkModule.supabaseRepository.fetchFarms()
                 if (farmsResult.isSuccess) {
                     val remoteFarms = farmsResult.getOrNull().orEmpty().filterNot { it.isDiagnostic() }
-                    farms.clear()
-                    farms.addAll(remoteFarms)
-                    AppDatabaseManager.saveFarmsAsync(context, farms)
+                    val remoteIds = remoteFarms.map { it.id }.toSet()
+                    val remoteNames = remoteFarms.map { it.name.trim().lowercase() }.toSet()
+
+                    // Fazendas criadas localmente offline que ainda não existem no Supabase
+                    val pendingLocalFarms = farms.filter { it.id !in remoteIds && it.name.trim().lowercase() !in remoteNames && !it.isDiagnostic() }
+                    for (pf in pendingLocalFarms) {
+                        try {
+                            NetworkModule.supabaseRepository.upsertFarm(pf)
+                        } catch (_: Exception) {}
+                    }
+
+                    val mergedFarms = (remoteFarms + pendingLocalFarms).distinctBy { it.name.trim().lowercase() }
+                    if (farms.toList() != mergedFarms) {
+                        farms.clear()
+                        farms.addAll(mergedFarms)
+                        AppDatabaseManager.saveFarmsAsync(context, farms)
+                    }
 
                     // Tenta garantir que qualquer registro residual de diagnóstico no Supabase seja excluído
                     try {
@@ -75,13 +89,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (_: Exception) {}
                 }
 
-                // 2. Sincronizar Usuários (espelha a lista remota do Supabase)
+                // 2. Sincronizar Usuários (espelha a lista remota do Supabase e sobe criados offline)
                 val usersResult = NetworkModule.supabaseRepository.fetchUsers()
                 if (usersResult.isSuccess) {
                     val remoteUsers = usersResult.getOrNull().orEmpty()
-                    if (remoteUsers.isNotEmpty()) {
+                    val remoteUsernames = remoteUsers.map { it.username.trim().lowercase() }.toSet()
+
+                    val pendingLocalUsers = users.filter { it.username.trim().lowercase() !in remoteUsernames && it.role == UserRole.FAZENDA }
+                    for (pu in pendingLocalUsers) {
+                        try {
+                            NetworkModule.supabaseRepository.upsertUser(pu)
+                        } catch (_: Exception) {}
+                    }
+
+                    val mergedUsers = (remoteUsers + pendingLocalUsers).distinctBy { it.username.trim().lowercase() }
+                    if (mergedUsers.isNotEmpty() && users.toList() != mergedUsers) {
                         users.clear()
-                        users.addAll(remoteUsers)
+                        users.addAll(mergedUsers)
                         AppDatabaseManager.saveUsersAsync(context, users)
                     }
                 }
