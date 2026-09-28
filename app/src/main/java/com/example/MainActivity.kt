@@ -4,16 +4,20 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -48,8 +52,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.example.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -148,16 +154,31 @@ class MainActivity : ComponentActivity() {
     enableEdgeToEdge()
     setContent {
       MyApplicationTheme(darkTheme = false, dynamicColor = false) {
+        val context = LocalContext.current
         val viewModel: AppViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
         val users = viewModel.users
         val farms = viewModel.farms
-        var currentUser by remember { mutableStateOf<UserAccount?>(null) }
+        var currentUser by remember { 
+          mutableStateOf<UserAccount?>(AppDatabaseManager.getLoggedInUser(context)) 
+        }
+
+        // Mantém a sessão sincronizada caso os dados do usuário logado sejam atualizados
+        LaunchedEffect(users.toList()) {
+          currentUser?.let { curr ->
+            val updated = users.find { it.username.equals(curr.username, ignoreCase = true) }
+            if (updated != null && updated != curr) {
+              currentUser = updated
+              AppDatabaseManager.saveLoggedInUser(context, updated)
+            }
+          }
+        }
         
         if (currentUser == null) {
           LoginScreen(
             availableFarms = farms.filterNot { it.isDiagnostic() },
             users = users,
             onLoginSuccess = { user ->
+              AppDatabaseManager.saveLoggedInUser(context, user)
               currentUser = user
             }
           )
@@ -166,6 +187,7 @@ class MainActivity : ComponentActivity() {
             currentUser = currentUser!!,
             viewModel = viewModel,
             onLogout = {
+              AppDatabaseManager.clearLoggedInUser(context)
               currentUser = null
             }
           )
@@ -365,6 +387,13 @@ fun ItacumbiAgroApp(
   var showLogActionOptionsDialog by remember { mutableStateOf(false) }
   var showEditLogDialog by remember { mutableStateOf(false) }
   var showDeleteLogConfirmDialog by remember { mutableStateOf(false) }
+
+  // Estados para Importação em Lote e Pré-visualização
+  var showBatchImportDialog by remember { mutableStateOf(false) }
+  var showImportPreviewDialog by remember { mutableStateOf(false) }
+  var parsedCsvResult by remember { mutableStateOf<ParsedCsvResult?>(null) }
+  var batchImportTargetFarm by remember { mutableStateOf("") }
+  var isSavingImport by remember { mutableStateOf(false) }
 
   Scaffold(
     containerColor = BrandBackground,
@@ -581,6 +610,14 @@ fun ItacumbiAgroApp(
                   onOpenCreateFarm = { showAddFarmDialog = true },
                   onOpenDatabaseExplorer = { showDatabaseViewerDialog = true },
                   onOpenExportSpreadsheet = { showExportSpreadsheetDialog = true },
+                  onOpenBatchImport = {
+                      batchImportTargetFarm = if (activeUser.role == UserRole.FAZENDA) {
+                          activeUser.assignedFarmName ?: selectedFarm.name
+                      } else {
+                          selectedFarm.name.ifBlank { accessibleFarms.firstOrNull()?.name ?: "" }
+                      }
+                      showBatchImportDialog = true
+                  },
                   onTriggerSync = { showSupabaseManagerDialog = true },
                   isSyncing = isSyncingData,
                   onLogout = onLogout
@@ -1702,6 +1739,10 @@ fun ItacumbiAgroApp(
                             NetworkModule.supabaseRepository.deleteUser(usernameToDelete)
                           }
                         }
+                        if (activeUser.username.equals(usernameToDelete, ignoreCase = true)) {
+                          AppDatabaseManager.clearLoggedInUser(context)
+                          onLogout()
+                        }
                         Toast.makeText(context, "Usuário excluído com sucesso", Toast.LENGTH_SHORT).show()
                         showEditUserDialog = false
                       },
@@ -1771,6 +1812,7 @@ fun ItacumbiAgroApp(
 
               if (isEditingSelf) {
                 activeUser = updated
+                AppDatabaseManager.saveLoggedInUser(context, updated)
               }
 
               Toast.makeText(context, "Dados de acesso atualizados com sucesso!", Toast.LENGTH_SHORT).show()
@@ -2618,7 +2660,545 @@ fun ItacumbiAgroApp(
       }
     )
   }
+
+  // --- DIALOG: IMPORTAÇÃO EM LOTE (MODELO OFICIAL & WHATSAPP) ---
+  if (showBatchImportDialog) {
+    val isGerencial = activeUser.role == UserRole.GERENCIAL
+    val initialTarget = if (isGerencial) {
+        selectedFarm.name.ifBlank { accessibleFarms.firstOrNull()?.name ?: "" }
+    } else {
+        activeUser.assignedFarmName ?: selectedFarm.name
+    }
+    var selectedFarmForImport by remember { mutableStateOf(initialTarget) }
+    var farmDropdownExpanded by remember { mutableStateOf(false) }
+    var isSharingTemplate by remember { mutableStateOf(false) }
+    var isParsingFile by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            isParsingFile = true
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val result = AppDatabaseManager.parseImportCsv(ctx, uri, selectedFarmForImport)
+                    withContext(Dispatchers.Main) {
+                        isParsingFile = false
+                        if (result.validLogs.isEmpty()) {
+                            Toast.makeText(ctx, "Nenhum lançamento válido encontrado no arquivo.", Toast.LENGTH_LONG).show()
+                        } else {
+                            parsedCsvResult = result
+                            batchImportTargetFarm = selectedFarmForImport
+                            showBatchImportDialog = false
+                            showImportPreviewDialog = true
+                        }
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        isParsingFile = false
+                        Toast.makeText(ctx, "Erro ao ler arquivo: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!isParsingFile && !isSharingTemplate) showBatchImportDialog = false },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier.size(38.dp).background(BrandGreenLight, RoundedCornerShape(10.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Filled.UploadFile, contentDescription = null, tint = BrandGreen, modifier = Modifier.size(22.dp))
+                }
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text("Importação em Lote", fontWeight = FontWeight.Black, style = MaterialTheme.typography.titleLarge, color = BrandTextPrimary)
+                    Text("Histórico Pluviométrico Oficial", style = MaterialTheme.typography.bodySmall, color = BrandTextSecondary)
+                }
+            }
+        },
+        containerColor = BrandSurface,
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = "Importe dados históricos de chuva de forma guiada e segura em 2 passos.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = BrandTextSecondary
+                )
+
+                // Seletor de Fazenda
+                Column {
+                    Text(
+                        text = "Fazenda de Destino:",
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = BrandTextPrimary
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    if (isGerencial && accessibleFarms.size > 1) {
+                        Box {
+                            OutlinedCard(
+                                onClick = { farmDropdownExpanded = true },
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.outlinedCardColors(containerColor = Color(0xFFF9FAFB)),
+                                border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Filled.Agriculture, contentDescription = null, tint = BrandGreen, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(selectedFarmForImport, fontWeight = FontWeight.Bold, color = BrandTextPrimary, fontSize = 14.sp)
+                                    }
+                                    Icon(Icons.Filled.ArrowDropDown, contentDescription = null, tint = BrandGreen)
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = farmDropdownExpanded,
+                                onDismissRequest = { farmDropdownExpanded = false },
+                                modifier = Modifier.background(BrandSurface)
+                            ) {
+                                accessibleFarms.forEach { f ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                f.name,
+                                                fontWeight = if (f.name == selectedFarmForImport) FontWeight.Bold else FontWeight.Normal,
+                                                color = if (f.name == selectedFarmForImport) BrandGreen else BrandTextPrimary
+                                            )
+                                        },
+                                        onClick = {
+                                            selectedFarmForImport = f.name
+                                            farmDropdownExpanded = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Surface(
+                            color = BrandGreenLight,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, BrandGreen.copy(alpha = 0.2f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.Agriculture, contentDescription = null, tint = BrandGreen, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(selectedFarmForImport, fontWeight = FontWeight.Bold, color = BrandTextPrimary, fontSize = 14.sp)
+                            }
+                        }
+                    }
+                }
+
+                // Passo 1: Modelo Oficial
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = BrandSurface),
+                    border = BorderStroke(1.dp, BrandGreen.copy(alpha = 0.35f))
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier.size(24.dp).background(BrandGreenLight, CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("1", color = BrandGreen, fontWeight = FontWeight.Black, fontSize = 12.sp)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Passo 1: Modelo Oficial",
+                                fontWeight = FontWeight.Bold,
+                                color = BrandTextPrimary,
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Gere a planilha CSV formatada para a fazenda selecionada e envie via WhatsApp ou E-mail para preenchimento no Excel do computador.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = BrandTextSecondary
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedButton(
+                            onClick = {
+                                isSharingTemplate = true
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        val file = AppDatabaseManager.generateTemplateCsv(ctx, selectedFarmForImport)
+                                        val contentUri = FileProvider.getUriForFile(
+                                            ctx,
+                                            "${ctx.packageName}.fileprovider",
+                                            file
+                                        )
+                                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                            type = "text/csv"
+                                            putExtra(Intent.EXTRA_SUBJECT, "Modelo de Importação - $selectedFarmForImport")
+                                            putExtra(
+                                                Intent.EXTRA_TEXT,
+                                                "Olá! Segue em anexo o modelo oficial em planilha para lançamento do histórico pluviométrico da fazenda $selectedFarmForImport.\n\nBasta preencher no computador e devolver este arquivo preenchido."
+                                            )
+                                            putExtra(Intent.EXTRA_STREAM, contentUri)
+                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            isSharingTemplate = false
+                                            ctx.startActivity(Intent.createChooser(shareIntent, "Enviar Modelo de Importação"))
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            isSharingTemplate = false
+                                            Toast.makeText(ctx, "Erro ao gerar modelo: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.2.dp, BrandGreen),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = BrandGreen),
+                            enabled = !isSharingTemplate
+                        ) {
+                            if (isSharingTemplate) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), color = BrandGreen, strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Gerando...", fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Compartilhar Modelo (WhatsApp)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                }
+
+                // Passo 2: Importar Planilha
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = BrandSurface),
+                    border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier.size(24.dp).background(Color(0xFFE0F2FE), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("2", color = Color(0xFF0284C7), fontWeight = FontWeight.Black, fontSize = 12.sp)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Passo 2: Importar Planilha",
+                                fontWeight = FontWeight.Bold,
+                                color = BrandTextPrimary,
+                                style = MaterialTheme.typography.titleSmall
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Selecione o arquivo Excel (.xlsx) ou CSV recebido da fazenda. O leitor inteligente valida os dias de chuva, descarta vazios e confere totais antes de gravar.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = BrandTextSecondary
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Button(
+                            onClick = {
+                                filePickerLauncher.launch(
+                                    arrayOf(
+                                        "*/*",
+                                        "text/csv",
+                                        "text/comma-separated-values",
+                                        "application/vnd.ms-excel",
+                                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        "application/octet-stream"
+                                    )
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth().height(46.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = BrandGreen),
+                            enabled = !isParsingFile
+                        ) {
+                            if (isParsingFile) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Lendo Planilha...", fontWeight = FontWeight.Bold)
+                            } else {
+                                Icon(Icons.Filled.FileOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Selecionar Planilha no Celular", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = { showBatchImportDialog = false }) {
+                Text("Fechar", color = BrandTextSecondary, fontWeight = FontWeight.Bold)
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+  }
+
+  // --- DIALOG: PRÉ-VISUALIZAÇÃO & CONFERÊNCIA DA IMPORTAÇÃO ---
+  if (showImportPreviewDialog && parsedCsvResult != null) {
+    val result = parsedCsvResult!!
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+
+    AlertDialog(
+        onDismissRequest = { if (!isSavingImport) showImportPreviewDialog = false },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier.size(38.dp).background(BrandGreenLight, RoundedCornerShape(10.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Filled.FactCheck, contentDescription = null, tint = BrandGreen, modifier = Modifier.size(22.dp))
+                }
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text("Conferência da Importação", fontWeight = FontWeight.Black, style = MaterialTheme.typography.titleLarge, color = BrandTextPrimary)
+                    Text("Prévia antes de gravar no banco", style = MaterialTheme.typography.bodySmall, color = BrandTextSecondary)
+                }
+            }
+        },
+        containerColor = BrandSurface,
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // Card Fazenda Destino
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = BrandGreenLight),
+                    border = BorderStroke(1.dp, BrandGreen.copy(alpha = 0.25f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Fazenda de Destino:", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium, color = BrandGreen)
+                            Spacer(Modifier.width(6.dp))
+                            Text(batchImportTargetFarm, fontWeight = FontWeight.Black, style = MaterialTheme.typography.bodyMedium, color = BrandTextPrimary)
+                        }
+                        if (result.detectedFarmName != null && !result.detectedFarmName.equals(batchImportTargetFarm, ignoreCase = true)) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "Atenção: A planilha identificou '${result.detectedFarmName}', mas a tela estava em '$batchImportTargetFarm'. Os dados serão vinculados à fazenda acima.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFFB45309),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+
+                // 3 Cards de KPI
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Dias c/ Chuva
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF9FAFB)),
+                        border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Dias c/ Chuva", style = MaterialTheme.typography.labelSmall, color = BrandTextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text("${result.validLogs.size}", fontWeight = FontWeight.Black, color = BrandGreen, fontSize = 18.sp)
+                            Text("> 0 mm", style = MaterialTheme.typography.labelSmall, color = BrandTextSecondary, fontSize = 9.sp)
+                        }
+                    }
+
+                    // Volume Total
+                    Card(
+                        modifier = Modifier.weight(1.1f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF9FAFB)),
+                        border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Volume Total", style = MaterialTheme.typography.labelSmall, color = BrandTextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text("${String.format(Locale.US, "%.1f", result.totalVolumeMm)}", fontWeight = FontWeight.Black, color = BrandWater, fontSize = 18.sp)
+                            Text("mm acumulados", style = MaterialTheme.typography.labelSmall, color = BrandTextSecondary, fontSize = 9.sp)
+                        }
+                    }
+
+                    // Ignorados
+                    Card(
+                        modifier = Modifier.weight(0.9f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF9FAFB)),
+                        border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Ignorados", style = MaterialTheme.typography.labelSmall, color = BrandTextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text("${result.ignoredEmptyLines}", fontWeight = FontWeight.Black, color = BrandTextSecondary, fontSize = 18.sp)
+                            Text("0 mm / vazios", style = MaterialTheme.typography.labelSmall, color = BrandTextSecondary, fontSize = 9.sp)
+                        }
+                    }
+                }
+
+                if (result.warnings.isNotEmpty()) {
+                    Surface(
+                        color = Color(0xFFFEF3C7),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "${result.warnings.size} aviso(s): ${result.warnings.take(2).joinToString("; ")}${if (result.warnings.size > 2) "..." else ""}",
+                            color = Color(0xFF92400E),
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(8.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    "Amostra dos Lançamentos:",
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = BrandTextPrimary
+                )
+
+                // Tabela de Amostra
+                val sampleLogs = result.validLogs.take(5)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFFF9FAFB), RoundedCornerShape(10.dp))
+                        .border(1.dp, Color(0xFFE5E7EB), RoundedCornerShape(10.dp))
+                        .padding(10.dp)
+                ) {
+                    sampleLogs.forEachIndexed { idx, itemLog ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                Text(
+                                    itemLog.date,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp,
+                                    color = BrandTextPrimary
+                                )
+                                if (itemLog.notes.isNotBlank()) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        "• ${itemLog.notes}",
+                                        fontSize = 11.sp,
+                                        color = BrandTextSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                            Text(
+                                "${String.format(Locale.US, "%.1f", itemLog.volumeMm)} mm",
+                                fontWeight = FontWeight.Black,
+                                fontSize = 12.sp,
+                                color = BrandWater
+                            )
+                        }
+                        if (idx < sampleLogs.size - 1) {
+                            HorizontalDivider(color = Color(0xFFE5E7EB), thickness = 0.5.dp)
+                        }
+                    }
+                    if (result.validLogs.size > 5) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "... e mais ${result.validLogs.size - 5} lançamentos no arquivo.",
+                            fontSize = 11.sp,
+                            color = BrandTextSecondary,
+                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    isSavingImport = true
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val newLogs = result.validLogs
+                            val currentLogs = AppDatabaseManager.loadLogs(ctx, emptyList())
+                            val updatedLogs = currentLogs + newLogs
+                            AppDatabaseManager.saveLogs(ctx, updatedLogs)
+                            withContext(Dispatchers.Main) {
+                                logs.addAll(newLogs)
+                                isSavingImport = false
+                                showImportPreviewDialog = false
+                                parsedCsvResult = null
+                                Toast.makeText(ctx, "Sucesso: ${newLogs.size} registros gravados para $batchImportTargetFarm!", Toast.LENGTH_LONG).show()
+                                performCloudSync(true)
+                            }
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
+                                isSavingImport = false
+                                Toast.makeText(ctx, "Erro ao gravar dados: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                },
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = BrandGreen),
+                enabled = !isSavingImport
+            ) {
+                if (isSavingImport) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Gravando...", fontWeight = FontWeight.Bold)
+                } else {
+                    Icon(Icons.Filled.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Confirmar e Gravar Dados", fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        dismissButton = {
+            if (!isSavingImport) {
+                OutlinedButton(
+                    onClick = { showImportPreviewDialog = false },
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("Cancelar", color = BrandTextSecondary, fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+  }
 }
+
 
 // --- TABS COMPOSABLES ---
 
@@ -2668,14 +3248,45 @@ fun LogsTab(
         }.distinct().sorted()
     }
 
-    // null = "Todos os Meses"
-    var selectedMonthNum by remember { 
-        mutableStateOf<String?>(availableMonthsInSelectedYear.lastOrNull() ?: currentSystemMonth) 
+    // Lista de meses exibidos no seletor: se for o ano atual, exibe apenas até o mês corrente
+    val displayedMonthNames = remember(monthNames, selectedYear, currentSystemYear, currentSystemMonth) {
+        val selYearInt = selectedYear.toIntOrNull() ?: 0
+        val curYearInt = currentSystemYear.toIntOrNull() ?: 0
+        val curMonthInt = currentSystemMonth.toIntOrNull() ?: 12
+
+        if (selYearInt == curYearInt) {
+            monthNames.filter { (code, _) -> (code.toIntOrNull() ?: 0) <= curMonthInt }
+        } else if (selYearInt > curYearInt) {
+            emptyList()
+        } else {
+            monthNames
+        }
     }
 
-    // Sync selected month when year/farm changes
-    LaunchedEffect(availableMonthsInSelectedYear) {
-        if (selectedMonthNum != null && selectedMonthNum !in availableMonthsInSelectedYear) {
+    // null = "Todos os Meses"
+    var selectedMonthNum by remember { 
+        val validInitial = availableMonthsInSelectedYear.filter { m ->
+            val selYearInt = selectedYear.toIntOrNull() ?: 0
+            val curYearInt = currentSystemYear.toIntOrNull() ?: 0
+            val curMonthInt = currentSystemMonth.toIntOrNull() ?: 12
+            if (selYearInt == curYearInt) (m.toIntOrNull() ?: 0) <= curMonthInt else true
+        }.lastOrNull() ?: currentSystemMonth
+        mutableStateOf<String?>(validInitial) 
+    }
+
+    // Sync selected month when farm/year changes, keeping user's chosen month if available or default
+    LaunchedEffect(selectedYear) {
+        val selYearInt = selectedYear.toIntOrNull() ?: 0
+        val curYearInt = currentSystemYear.toIntOrNull() ?: 0
+        val curMonthInt = currentSystemMonth.toIntOrNull() ?: 12
+
+        if (selYearInt == curYearInt && selectedMonthNum != null) {
+            val selMonthInt = selectedMonthNum?.toIntOrNull() ?: 0
+            if (selMonthInt > curMonthInt) {
+                selectedMonthNum = currentSystemMonth
+            }
+        }
+        if (selectedMonthNum == null && availableMonthsInSelectedYear.isNotEmpty()) {
             selectedMonthNum = availableMonthsInSelectedYear.lastOrNull()
         }
     }
@@ -2808,14 +3419,17 @@ fun LogsTab(
                             DropdownMenu(
                                 expanded = monthMenuExpanded,
                                 onDismissRequest = { monthMenuExpanded = false },
-                                modifier = Modifier.background(BrandSurface)
+                                modifier = Modifier
+                                    .background(BrandSurface)
+                                    .widthIn(min = 165.dp)
                             ) {
                                 DropdownMenuItem(
                                     text = {
                                         Text(
                                             "Todos os Meses",
                                             fontWeight = if (selectedMonthNum == null) FontWeight.Bold else FontWeight.Normal,
-                                            color = if (selectedMonthNum == null) BrandGreen else BrandTextPrimary
+                                            color = if (selectedMonthNum == null) BrandGreen else BrandTextPrimary,
+                                            fontSize = 14.sp
                                         )
                                     },
                                     onClick = {
@@ -2824,19 +3438,32 @@ fun LogsTab(
                                     }
                                 )
                                 HorizontalDivider()
-                                val displayedMonths = if (availableMonthsInSelectedYear.isNotEmpty()) {
-                                    monthNames.filter { it.first in availableMonthsInSelectedYear }
-                                } else {
-                                    monthNames
-                                }
-                                displayedMonths.forEach { (code, name) ->
+                                displayedMonthNames.forEach { (code, name) ->
+                                    val monthLogs = logs.filter { log ->
+                                        val parts = log.date.split("/")
+                                        parts.size >= 3 && parts[2] == selectedYear && parts[1] == code
+                                    }
+                                    val monthVol = monthLogs.sumOf { it.volumeMm }
+                                    val hasRain = monthLogs.any { it.volumeMm > 0.0 }
                                     DropdownMenuItem(
                                         text = {
-                                            Text(
-                                                name,
-                                                fontWeight = if (selectedMonthNum == code) FontWeight.Bold else FontWeight.Normal,
-                                                color = if (selectedMonthNum == code) BrandGreen else BrandTextPrimary
-                                            )
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = name,
+                                                    fontWeight = if (selectedMonthNum == code) FontWeight.Bold else FontWeight.Normal,
+                                                    color = if (selectedMonthNum == code) BrandGreen else BrandTextPrimary,
+                                                    fontSize = 14.sp
+                                                )
+                                                Spacer(Modifier.width(8.dp))
+                                                Text(
+                                                    text = if (hasRain && monthVol > 0.0) "${String.format(Locale("pt", "BR"), "%.1f", monthVol)} mm" else "0,0 mm",
+                                                    fontSize = 9.sp,
+                                                    color = if (hasRain && monthVol > 0.0) BrandWater else BrandTextSecondary.copy(alpha = 0.5f),
+                                                    fontWeight = if (hasRain && monthVol > 0.0) FontWeight.SemiBold else FontWeight.Normal
+                                                )
+                                            }
                                         },
                                         onClick = {
                                             selectedMonthNum = code
@@ -2943,6 +3570,53 @@ fun LogsTab(
             }
         }
 
+        // 12-Month Overview: Rainy months vs Zeroed (Estiagem)
+        item {
+            val monthsWithRainCount = remember(logs, selectedYear) {
+                (1..12).count { m ->
+                    val mStr = String.format(Locale.US, "%02d", m)
+                    logs.any { l ->
+                        val parts = l.date.split("/")
+                        parts.size >= 3 && parts[2] == selectedYear && parts[1] == mStr && l.volumeMm > 0.0
+                    }
+                }
+            }
+            val dryMonthsCount = 12 - monthsWithRainCount
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    color = BrandGreenLight,
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = "$monthsWithRainCount ${if (monthsWithRainCount == 1) "mês com chuva" else "meses com chuva"}",
+                        color = BrandGreen,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+                Surface(
+                    color = if (dryMonthsCount > 0) Color(0xFFFEF3C7) else Color(0xFFF3F4F6),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        text = "$dryMonthsCount ${if (dryMonthsCount == 1) "mês zerado (estiagem)" else "meses zerados (estiagem)"}",
+                        color = if (dryMonthsCount > 0) Color(0xFFB45309) else BrandTextSecondary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+        }
+
         // Section Title
         item {
             Row(
@@ -2959,9 +3633,10 @@ fun LogsTab(
                     color = BrandTextPrimary
                 )
                 Text(
-                    text = "${filteredLogs.size} ${if (filteredLogs.size == 1) "registro" else "registros"}",
+                    text = if (filteredLogs.isEmpty()) "0.0 mm (zerado)" else "${filteredLogs.size} ${if (filteredLogs.size == 1) "registro" else "registros"}",
                     style = MaterialTheme.typography.labelSmall,
-                    color = BrandTextSecondary
+                    color = if (filteredLogs.isEmpty()) Color(0xFFB45309) else BrandTextSecondary,
+                    fontWeight = if (filteredLogs.isEmpty()) FontWeight.Bold else FontWeight.Normal
                 )
             }
         }
@@ -2974,13 +3649,13 @@ fun LogsTab(
             )
         }
 
-        // Empty state
+        // Estado Vazio / Estiagem (Mês Zerado)
         if (filteredLogs.isEmpty()) {
             item {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 24.dp),
+                        .padding(vertical = 12.dp),
                     shape = RoundedCornerShape(16.dp),
                     colors = CardDefaults.cardColors(containerColor = BrandSurface),
                     border = BorderStroke(1.dp, Color(0xFFE5E7EB))
@@ -2988,34 +3663,70 @@ fun LogsTab(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(32.dp),
+                            .padding(24.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Icon(
-                            Icons.Filled.CalendarMonth,
-                            contentDescription = null,
-                            tint = Color(0xFF9CA3AF),
-                            modifier = Modifier.size(40.dp)
-                        )
-                        Spacer(Modifier.height(12.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(52.dp)
+                                .background(Color(0xFFFEF3C7), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Filled.WbSunny,
+                                contentDescription = null,
+                                tint = Color(0xFFD97706),
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+                        Spacer(Modifier.height(14.dp))
                         Text(
-                            "Nenhum registro em $selectedMonthLabel/$selectedYear",
-                            fontWeight = FontWeight.Bold,
+                            text = if (selectedMonthNum != null) 
+                                "Mês de Estiagem: 0.0 mm em $selectedMonthLabel de $selectedYear"
+                            else 
+                                "Sem lançamentos pluviométricos em $selectedYear",
+                            fontWeight = FontWeight.Black,
                             color = BrandTextPrimary,
-                            style = MaterialTheme.typography.bodyMedium
+                            style = MaterialTheme.typography.titleMedium,
+                            textAlign = TextAlign.Center
                         )
-                        Spacer(Modifier.height(4.dp))
+                        Spacer(Modifier.height(6.dp))
                         Text(
-                            "Use o botão + para lançar dados pluviométricos.",
+                            text = if (selectedMonthNum != null)
+                                "Não houve nenhuma chuva registrada neste período (0 dias com chuva computados)."
+                            else
+                                "Todos os 12 meses constam zerados (0.0 mm / estiagem) para este ano.",
                             color = BrandTextSecondary,
-                            style = MaterialTheme.typography.labelSmall
+                            style = MaterialTheme.typography.bodySmall,
+                            textAlign = TextAlign.Center
                         )
+                        Spacer(Modifier.height(14.dp))
+                        Surface(
+                            color = Color(0xFFF3F4F6),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = if (selectedMonthNum != null) "Volume Acumulado: 0.0 mm • 0 dias c/ chuva" else "Ano 100% em estiagem (0.0 mm)",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = BrandTextPrimary,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
+                        }
                     }
                 }
             }
         }
     }
+
 }
+
+data class YearRainSummary(
+    val year: Int,
+    val totalMm: Double,
+    val rainyDays: Int
+)
+
 
 data class MonthStats(
     val month: String,
@@ -3028,13 +3739,266 @@ data class MonthStats(
 data class KpiDisplayData(val volume: Double, val rainyDays: Int, val monthLabel: String, val prevYearVolume: Double? = null)
 
 @Composable
+fun MultiYearHistoryChart(
+    data: List<YearRainSummary>,
+    selectedYear: Int,
+    averageVolume: Double,
+    onSelectYear: (Int) -> Unit
+) {
+    val maxVal = data.maxOfOrNull { it.totalMm }?.coerceAtLeast(1.0) ?: 1.0
+    val scrollState = rememberScrollState()
+    val coroutineScope = rememberCoroutineScope()
+    val isScrollable = data.size > 5
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Card(
+            modifier = Modifier.fillMaxWidth().height(240.dp),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = BrandSurface),
+            border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
+            ) {
+                // Header inside the card
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Evolução Histórica Anual (mm)",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = BrandTextPrimary
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = BrandGreenLight,
+                        border = BorderStroke(1.dp, BrandGreen.copy(alpha = 0.25f))
+                    ) {
+                        Text(
+                            text = "Média: ${String.format(Locale.US, "%,.0f", averageVolume).replace(',', '.')} mm",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = BrandGreen,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // Chart Bars Area
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .then(if (isScrollable) Modifier.horizontalScroll(scrollState) else Modifier),
+                    horizontalArrangement = if (isScrollable) Arrangement.spacedBy(12.dp) else Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    data.forEach { item ->
+                        val isSelected = item.year == selectedYear
+                        val fraction = if (maxVal > 0) (item.totalMm / maxVal).toFloat().coerceIn(0f, 1f) else 0f
+
+                        val barColor by animateColorAsState(
+                            targetValue = if (isSelected) BrandWater else Color(0xFFCFD8DC),
+                            animationSpec = tween(250),
+                            label = "yearBarColor"
+                        )
+                        val textColor by animateColorAsState(
+                            targetValue = if (isSelected) BrandWater else BrandTextPrimary,
+                            animationSpec = tween(250),
+                            label = "yearTextColor"
+                        )
+                        val colBg by animateColorAsState(
+                            targetValue = if (isSelected) BrandWater.copy(alpha = 0.10f) else Color.Transparent,
+                            animationSpec = tween(250),
+                            label = "yearColBg"
+                        )
+
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Bottom,
+                            modifier = Modifier
+                                .then(if (isScrollable) Modifier.width(62.dp) else Modifier.weight(1f))
+                                .fillMaxHeight()
+                                .background(colBg, RoundedCornerShape(10.dp))
+                                .then(
+                                    if (isSelected) Modifier.border(1.dp, BrandWater.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                                    else Modifier
+                                )
+                                .clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) { onSelectYear(item.year) }
+                                .padding(horizontal = 2.dp, vertical = 6.dp)
+                        ) {
+                            BoxWithConstraints(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.BottomCenter
+                            ) {
+                                val maxBarHeight = (maxHeight - 18.dp).coerceAtLeast(10.dp)
+                                val targetHeight = if (item.totalMm > 0) (maxBarHeight * fraction).coerceAtLeast(6.dp) else 2.dp
+                                val animatedHeight by animateDpAsState(
+                                    targetValue = targetHeight,
+                                    animationSpec = tween(300),
+                                    label = "barHeight"
+                                )
+
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Bottom
+                                ) {
+                                    Text(
+                                        text = "${item.totalMm.toInt()}",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                        fontWeight = if (isSelected) FontWeight.Black else FontWeight.Bold,
+                                        color = textColor,
+                                        maxLines = 1,
+                                        softWrap = false
+                                    )
+                                    Spacer(Modifier.height(3.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .width(22.dp)
+                                            .height(animatedHeight)
+                                            .background(
+                                                barColor,
+                                                RoundedCornerShape(topStart = 5.dp, topEnd = 5.dp)
+                                            )
+                                    )
+                                }
+                            }
+
+                            Spacer(Modifier.height(6.dp))
+
+                            Text(
+                                text = "${item.year}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                fontWeight = if (isSelected) FontWeight.Black else FontWeight.Bold,
+                                color = textColor,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                            Text(
+                                text = "${item.rainyDays}d chuva",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                color = if (isSelected) BrandWater else BrandTextSecondary,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pagination / Carrossel Dots
+        if (isScrollable) {
+            Spacer(Modifier.height(8.dp))
+            val numDots = if (data.size <= 6) 3 else 4
+            val scrollFraction = if (scrollState.maxValue > 0) {
+                (scrollState.value.toFloat() / scrollState.maxValue).coerceIn(0f, 1f)
+            } else 0f
+            val activeDotIndex = (scrollFraction * (numDots - 1)).roundToInt().coerceIn(0, numDots - 1)
+
+            val canScrollBack = scrollState.value > 15
+            val canScrollForward = scrollState.value < (scrollState.maxValue - 15)
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = {
+                        coroutineScope.launch {
+                            val step = scrollState.maxValue / (numDots - 1).coerceAtLeast(1)
+                            scrollState.animateScrollTo((scrollState.value - step).coerceAtLeast(0))
+                        }
+                    },
+                    enabled = canScrollBack,
+                    modifier = Modifier.size(24.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.ChevronLeft,
+                        contentDescription = "Rolar para anos anteriores",
+                        tint = if (canScrollBack) BrandGreen else Color(0xFFE2E8F0),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                Spacer(Modifier.width(6.dp))
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    for (i in 0 until numDots) {
+                        val isActive = i == activeDotIndex
+                        val dotWidth by animateDpAsState(
+                            targetValue = if (isActive) 20.dp else 7.dp,
+                            animationSpec = tween(250),
+                            label = "dotWidth"
+                        )
+                        val dotColor by animateColorAsState(
+                            targetValue = if (isActive) BrandWater else Color(0xFFCBD5E1),
+                            animationSpec = tween(250),
+                            label = "dotColor"
+                        )
+
+                        Box(
+                            modifier = Modifier
+                                .height(7.dp)
+                                .width(dotWidth)
+                                .background(dotColor, RoundedCornerShape(3.5.dp))
+                                .clickable {
+                                    coroutineScope.launch {
+                                        val target = if (scrollState.maxValue > 0) {
+                                            (scrollState.maxValue * (i.toFloat() / (numDots - 1))).toInt()
+                                        } else 0
+                                        scrollState.animateScrollTo(target)
+                                    }
+                                }
+                        )
+                    }
+                }
+
+                Spacer(Modifier.width(6.dp))
+
+                IconButton(
+                    onClick = {
+                        coroutineScope.launch {
+                            val step = scrollState.maxValue / (numDots - 1).coerceAtLeast(1)
+                            scrollState.animateScrollTo((scrollState.value + step).coerceAtMost(scrollState.maxValue))
+                        }
+                    },
+                    enabled = canScrollForward,
+                    modifier = Modifier.size(24.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.ChevronRight,
+                        contentDescription = "Rolar para próximos anos",
+                        tint = if (canScrollForward) BrandGreen else Color(0xFFE2E8F0),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun StatsTab(logs: List<RainfallLog>) {
     val monthNames = listOf("JAN", "FEV", "MAR", "ABR", "MAI", "JUN", "JUL", "AGO", "SET", "OUT", "NOV", "DEZ")
-
     val calendar = remember { Calendar.getInstance() }
     val currentYearSystem = calendar.get(Calendar.YEAR)
 
-    // 1. Discover years present in the logs for this farm
+    // 1. Descobrir anos presentes nos registros desta fazenda
     val yearsPresent = remember(logs) {
         logs.mapNotNull { log ->
             val parts = log.date.split("/")
@@ -3043,33 +4007,112 @@ fun StatsTab(logs: List<RainfallLog>) {
     }
 
     val hasLogs = logs.isNotEmpty() && yearsPresent.isNotEmpty()
-    val primaryYearInt = yearsPresent.firstOrNull() ?: currentYearSystem
-    val prevYearInt = if (yearsPresent.size >= 2) yearsPresent[1] else null
-    val hasComparison = prevYearInt != null
 
-    val currentYearTag = primaryYearInt.toString()
-    val prevYearTag = prevYearInt?.toString() ?: ""
-
-    // 2. Discover months that actually have rainfall records for this farm
-    val monthsWithData = remember(logs, primaryYearInt, prevYearInt) {
-        logs.mapNotNull { log ->
+    // 2. Resumo multianual para cada ano registrado
+    val yearsData = remember(logs, yearsPresent) {
+        val mapMm = mutableMapOf<Int, Double>()
+        val mapDays = mutableMapOf<Int, Int>()
+        for (log in logs) {
             val parts = log.date.split("/")
             if (parts.size >= 3) {
-                val m = parts[1].toIntOrNull()
                 val y = parts[2].toIntOrNull()
-                if (m != null && m in 1..12) {
-                    if (y == primaryYearInt || (prevYearInt != null && y == prevYearInt)) m else null
-                } else null
-            } else null
-        }.distinct().sorted()
+                if (y != null) {
+                    mapMm[y] = (mapMm[y] ?: 0.0) + log.volumeMm
+                    if (log.volumeMm > 0.0) {
+                        mapDays[y] = (mapDays[y] ?: 0) + 1
+                    }
+                }
+            }
+        }
+        yearsPresent.sorted().map { y ->
+            YearRainSummary(
+                year = y,
+                totalMm = mapMm[y] ?: 0.0,
+                rainyDays = mapDays[y] ?: 0
+            )
+        }
     }
 
-    // 3. Dynamic stats calculated exclusively from real logs for active months
-    val statsData = remember(logs, primaryYearInt, prevYearInt, monthsWithData) {
-        val curYearRain = FloatArray(12)
-        val prevYearRain = FloatArray(12)
-        val curYearDays = IntArray(12)
-        val prevYearDays = IntArray(12)
+    val averageAnnualVolume = remember(yearsData) {
+        if (yearsData.isNotEmpty()) yearsData.map { it.totalMm }.average() else 0.0
+    }
+    val maxRainYear = remember(yearsData) { yearsData.maxByOrNull { it.totalMm } }
+    val minRainYear = remember(yearsData) { yearsData.minByOrNull { it.totalMm } }
+
+    // Estado do ano selecionado no gráfico multianual
+    var selectedMultiYear by remember(yearsPresent) {
+        mutableStateOf(yearsPresent.firstOrNull() ?: currentYearSystem)
+    }
+
+    // Estados dos seletores de Ano Base e Comparação ("Análise Detalhada por Ano")
+    var baseYear by remember(yearsPresent) {
+        mutableStateOf(yearsPresent.firstOrNull() ?: currentYearSystem)
+    }
+    var compareYear by remember(yearsPresent) {
+        mutableStateOf(if (yearsPresent.size >= 2) yearsPresent[1] else null)
+    }
+    val hasComparison = compareYear != null
+
+    var baseYearMenuExpanded by remember { mutableStateOf(false) }
+    var compareYearMenuExpanded by remember { mutableStateOf(false) }
+
+    // 3. Cálculo do Período Homólogo:
+    // Determina o último mês com registros no Ano Base
+    val latestMonthInBaseYear = remember(logs, baseYear) {
+        val months = logs.mapNotNull { log ->
+            val parts = log.date.split("/")
+            if (parts.size >= 3 && parts[2].toIntOrNull() == baseYear) {
+                parts[1].toIntOrNull()
+            } else null
+        }
+        months.maxOrNull() ?: 12
+    }
+
+    val homologousMonthName = monthNames.getOrElse((latestMonthInBaseYear - 1).coerceIn(0, 11)) { "DEZ" }
+
+    // Acumulado homólogo do Ano Base (mês 1 até latestMonthInBaseYear)
+    val (baseYearHomologousRain, baseYearHomologousDays) = remember(logs, baseYear, latestMonthInBaseYear) {
+        var rain = 0.0
+        var days = 0
+        for (log in logs) {
+            val parts = log.date.split("/")
+            if (parts.size >= 3 && parts[2].toIntOrNull() == baseYear) {
+                val m = parts[1].toIntOrNull() ?: 0
+                if (m in 1..latestMonthInBaseYear) {
+                    rain += log.volumeMm
+                    if (log.volumeMm > 0.0) days++
+                }
+            }
+        }
+        Pair(rain, days)
+    }
+
+    // Acumulado homólogo do Ano Comparativo (mês 1 até latestMonthInBaseYear)
+    val (compareYearHomologousRain, compareYearHomologousDays) = remember(logs, compareYear, latestMonthInBaseYear) {
+        if (compareYear == null) Pair(0.0, 0)
+        else {
+            var rain = 0.0
+            var days = 0
+            for (log in logs) {
+                val parts = log.date.split("/")
+                if (parts.size >= 3 && parts[2].toIntOrNull() == compareYear) {
+                    val m = parts[1].toIntOrNull() ?: 0
+                    if (m in 1..latestMonthInBaseYear) {
+                        rain += log.volumeMm
+                        if (log.volumeMm > 0.0) days++
+                    }
+                }
+            }
+            Pair(rain, days)
+        }
+    }
+
+    // 4. Dados mensais para o período homólogo (exibindo todos os meses de 1 até latestMonthInBaseYear)
+    val monthlyStatsData = remember(logs, baseYear, compareYear, latestMonthInBaseYear) {
+        val curRain = FloatArray(12)
+        val prevRain = FloatArray(12)
+        val curDays = IntArray(12)
+        val prevDays = IntArray(12)
 
         for (log in logs) {
             val parts = log.date.split("/")
@@ -3078,36 +4121,38 @@ fun StatsTab(logs: List<RainfallLog>) {
                 val y = parts[2].toIntOrNull()
                 if (m != null && y != null && m in 1..12) {
                     val idx = m - 1
-                    if (y == primaryYearInt) {
-                        curYearRain[idx] += log.volumeMm.toFloat()
-                        if (log.volumeMm > 0.0) curYearDays[idx]++
-                    } else if (prevYearInt != null && y == prevYearInt) {
-                        prevYearRain[idx] += log.volumeMm.toFloat()
-                        if (log.volumeMm > 0.0) prevYearDays[idx]++
+                    if (y == baseYear) {
+                        curRain[idx] += log.volumeMm.toFloat()
+                        if (log.volumeMm > 0.0) curDays[idx]++
+                    } else if (compareYear != null && y == compareYear) {
+                        prevRain[idx] += log.volumeMm.toFloat()
+                        if (log.volumeMm > 0.0) prevDays[idx]++
                     }
                 }
             }
         }
 
-        monthsWithData.map { m ->
+        val limitMonth = latestMonthInBaseYear.coerceIn(1, 12)
+        (1..limitMonth).map { m ->
             val idx = m - 1
             MonthStats(
                 month = monthNames[idx],
-                currentYear = curYearRain[idx],
-                previousYear = if (hasComparison) prevYearRain[idx] else 0f,
+                currentYear = curRain[idx],
+                previousYear = if (hasComparison) prevRain[idx] else 0f,
                 monthIndex = m,
-                currentYearRainyDays = curYearDays[idx],
-                prevYearRainyDays = if (hasComparison) prevYearDays[idx] else 0
+                currentYearRainyDays = curDays[idx],
+                prevYearRainyDays = if (hasComparison) prevDays[idx] else 0
             )
         }
     }
 
-    val accumulatedStatsData = remember(statsData, hasComparison) {
+    // 5. Dados acumulados para o período homólogo
+    val accumulatedStatsData = remember(monthlyStatsData, hasComparison) {
         var accCurrent = 0f
         var accPrev = 0f
         var accCurDays = 0
         var accPrevDays = 0
-        statsData.map {
+        monthlyStatsData.map {
             accCurrent += it.currentYear
             accPrev += it.previousYear
             accCurDays += it.currentYearRainyDays
@@ -3126,43 +4171,12 @@ fun StatsTab(logs: List<RainfallLog>) {
     var selectedIndex by remember(logs) { mutableStateOf<Int?>(null) }
     var accSelectedIndex by remember(logs) { mutableStateOf<Int?>(null) }
     var selectedYearFilter by remember(logs) { mutableStateOf<String?>(null) }
-    
-    // Determine effective selected index: priority to selectedIndex (monthly/table), fallback to accSelectedIndex
-    val activeIndex = selectedIndex ?: accSelectedIndex
-    val currentMonthName = monthNames[calendar.get(Calendar.MONTH)]
-
-    val totalAnnualVolume = remember(statsData) { statsData.sumOf { it.currentYear.toDouble() } }
-
-    val (displayVolume, displayRainyDays, displayMonthLabel, displayPrevYearVolume) = remember(activeIndex, statsData, hasComparison) {
-        if (activeIndex != null && activeIndex in statsData.indices) {
-            val stat = statsData[activeIndex]
-            KpiDisplayData(
-                stat.currentYear.toDouble(), 
-                stat.currentYearRainyDays, 
-                stat.month, 
-                if (hasComparison) stat.previousYear.toDouble() else null
-            )
-        } else {
-            // Default to latest month with data
-            val latest = statsData.lastOrNull()
-            if (latest != null) {
-                KpiDisplayData(
-                    latest.currentYear.toDouble(), 
-                    latest.currentYearRainyDays, 
-                    latest.month, 
-                    if (hasComparison) latest.previousYear.toDouble() else null
-                )
-            } else {
-                KpiDisplayData(0.0, 0, currentMonthName, null)
-            }
-        }
-    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
         contentPadding = PaddingValues(top = 24.dp, bottom = 88.dp)
     ) {
-        if (!hasLogs || statsData.isEmpty()) {
+        if (!hasLogs || yearsData.isEmpty()) {
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
@@ -3206,25 +4220,419 @@ fun StatsTab(logs: List<RainfallLog>) {
                 }
             }
         } else {
+            // --- 1. HISTÓRICO MULTIANUAL & CARDS KPI ---
             item {
-                ModernKpiRow(
-                    totalVolume = displayVolume, 
-                    rainyDays = displayRainyDays,
-                    monthLabel = displayMonthLabel,
-                    previousYearVolume = displayPrevYearVolume,
-                    currentYearTag = currentYearTag,
-                    previousYearTag = prevYearTag,
-                    hasComparison = hasComparison,
-                    totalYearVolume = totalAnnualVolume
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Histórico Multianual",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = BrandTextPrimary
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = BrandGreenLight,
+                        border = BorderStroke(1.dp, BrandGreen.copy(alpha = 0.25f))
+                    ) {
+                        Text(
+                            text = "${yearsData.size} anos registrados",
+                            color = BrandGreen,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                // Trio de Cards KPI
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    // Card 1: Média Anual
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = BrandGreenLight),
+                        border = BorderStroke(1.dp, BrandGreen.copy(alpha = 0.20f))
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "MÉDIA ANUAL",
+                                color = BrandGreen,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "${String.format(Locale.US, "%,.0f", averageAnnualVolume).replace(',', '.')} mm",
+                                color = BrandGreen,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Black
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "Base: ${yearsData.size} anos",
+                                color = BrandGreen.copy(alpha = 0.85f),
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+                            )
+                        }
+                    }
+
+                    // Card 2: Mais Chuvoso
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = BrandSurface),
+                        border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "MAIS CHUVOSO",
+                                color = BrandTextSecondary,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "${String.format(Locale.US, "%,.0f", maxRainYear?.totalMm ?: 0.0).replace(',', '.')} mm",
+                                color = BrandTextPrimary,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Black
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "Ano ${maxRainYear?.year ?: "-"}",
+                                color = BrandWater,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    // Card 3: Mais Seco
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = BrandSurface),
+                        border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = "MAIS SECO",
+                                color = BrandTextSecondary,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "${String.format(Locale.US, "%,.0f", minRainYear?.totalMm ?: 0.0).replace(',', '.')} mm",
+                                color = BrandTextPrimary,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Black
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = "Ano ${minRainYear?.year ?: "-"}",
+                                color = Color(0xFFE65100),
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
+
+                // Gráfico de Colunas Multianual
+                MultiYearHistoryChart(
+                    data = yearsData,
+                    selectedYear = selectedMultiYear,
+                    averageVolume = averageAnnualVolume,
+                    onSelectYear = { y ->
+                        selectedMultiYear = y
+                        baseYear = y
+                    }
                 )
             }
+
+            // --- 2. ANÁLISE DETALHADA POR ANO (SELETORES & CARDS HOMÓLOGOS) ---
+            item {
+                Spacer(Modifier.height(24.dp))
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = BrandSurface),
+                    border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "Análise Detalhada por Ano",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = BrandTextPrimary
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = "Escolha o ano base e o ano de comparação",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = BrandTextSecondary
+                        )
+                        Spacer(Modifier.height(16.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            // Dropdown Ano Base
+                            Box(modifier = Modifier.weight(1f)) {
+                                OutlinedCard(
+                                    onClick = { baseYearMenuExpanded = true },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = CardDefaults.outlinedCardColors(containerColor = Color(0xFFF9FAFB)),
+                                    border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                                ) {
+                                    Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                                        Text(
+                                            text = "Ano Base",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = BrandTextSecondary
+                                        )
+                                        Spacer(Modifier.height(4.dp))
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "Ano $baseYear",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = BrandWater
+                                            )
+                                            Icon(
+                                                imageVector = Icons.Filled.ArrowDropDown,
+                                                contentDescription = null,
+                                                tint = BrandTextSecondary,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                DropdownMenu(
+                                    expanded = baseYearMenuExpanded,
+                                    onDismissRequest = { baseYearMenuExpanded = false }
+                                ) {
+                                    yearsPresent.forEach { y ->
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = "Ano $y",
+                                                    fontWeight = if (y == baseYear) FontWeight.Bold else FontWeight.Normal,
+                                                    color = if (y == baseYear) BrandWater else BrandTextPrimary
+                                                )
+                                            },
+                                            onClick = {
+                                                baseYear = y
+                                                selectedMultiYear = y
+                                                if (compareYear == y) {
+                                                    compareYear = yearsPresent.firstOrNull { it != y }
+                                                }
+                                                baseYearMenuExpanded = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Dropdown Comparar com
+                            Box(modifier = Modifier.weight(1f)) {
+                                OutlinedCard(
+                                    onClick = { compareYearMenuExpanded = true },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = CardDefaults.outlinedCardColors(containerColor = Color(0xFFF9FAFB)),
+                                    border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                                ) {
+                                    Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                                        Text(
+                                            text = "Comparar com",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = BrandTextSecondary
+                                        )
+                                        Spacer(Modifier.height(4.dp))
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = if (compareYear != null) "Ano $compareYear" else "Sem Comparativo",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (compareYear != null) BrandTextPrimary else BrandTextSecondary,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Icon(
+                                                imageVector = Icons.Filled.ArrowDropDown,
+                                                contentDescription = null,
+                                                tint = BrandTextSecondary,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                DropdownMenu(
+                                    expanded = compareYearMenuExpanded,
+                                    onDismissRequest = { compareYearMenuExpanded = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = "Sem Comparativo",
+                                                fontWeight = if (compareYear == null) FontWeight.Bold else FontWeight.Normal,
+                                                color = if (compareYear == null) BrandGreen else BrandTextPrimary
+                                            )
+                                        },
+                                        onClick = {
+                                            compareYear = null
+                                            compareYearMenuExpanded = false
+                                        }
+                                    )
+                                    yearsPresent.filter { it != baseYear }.forEach { y ->
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = "Ano $y",
+                                                    fontWeight = if (y == compareYear) FontWeight.Bold else FontWeight.Normal,
+                                                    color = if (y == compareYear) BrandGreen else BrandTextPrimary
+                                                )
+                                            },
+                                            onClick = {
+                                                compareYear = y
+                                                compareYearMenuExpanded = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                // Dois Cards de Período Homólogo
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    // Card: Chuva Acumulada
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = BrandSurface),
+                        border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = BrandGreenLight
+                            ) {
+                                Text(
+                                    text = "Ano $baseYear • JAN a $homologousMonthName",
+                                    color = BrandGreen,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                text = "Chuva Acumulada",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = BrandTextSecondary
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = "${String.format(Locale.US, "%.1f", baseYearHomologousRain)} mm",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Black,
+                                color = BrandTextPrimary
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = if (hasComparison) "$compareYear: ${String.format(Locale.US, "%.0f", compareYearHomologousRain)} mm" else "No período",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = BrandTextSecondary
+                            )
+                        }
+                    }
+
+                    // Card: Dias c/ Chuva
+                    Card(
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = BrandSurface),
+                        border = BorderStroke(1.dp, Color(0xFFE5E7EB))
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = BrandGreenLight
+                            ) {
+                                Text(
+                                    text = "Ano $baseYear • JAN a $homologousMonthName",
+                                    color = BrandGreen,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                text = "Dias c/ Chuva",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = BrandTextSecondary
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = "$baseYearHomologousDays dias",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Black,
+                                color = BrandTextPrimary
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = if (hasComparison) "Período: JAN a $homologousMonthName" else "No período",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = BrandTextSecondary
+                            )
+                        }
+                    }
+                }
+            }
+
+            // --- 3. COMPARATIVO MENSAL ---
             item {
                 Spacer(modifier = Modifier.height(28.dp))
                 SectionHeader(
                     title = if (hasComparison) "Comparativo Mensal (mm)" else "Precipitação Mensal (mm)",
+                    subtitle = "Período homólogo até $homologousMonthName",
                     showLegend = true,
-                    currentYearTag = currentYearTag,
-                    previousYearTag = prevYearTag,
+                    currentYearTag = baseYear.toString(),
+                    previousYearTag = compareYear?.toString() ?: "",
                     selectedYearFilter = selectedYearFilter,
                     hasComparison = hasComparison,
                     onSelectYear = { year ->
@@ -3234,42 +4642,48 @@ fun StatsTab(logs: List<RainfallLog>) {
             }
             item {
                 InteractiveComparisonChart(
-                    data = statsData,
+                    data = monthlyStatsData,
                     selectedIndex = selectedIndex,
                     onSelect = { idx -> selectedIndex = if (selectedIndex == idx) null else idx },
                     selectedYearFilter = selectedYearFilter,
-                    currentYearTag = currentYearTag,
-                    previousYearTag = prevYearTag,
+                    currentYearTag = baseYear.toString(),
+                    previousYearTag = compareYear?.toString() ?: "",
                     hasComparison = hasComparison
                 )
             }
+
+            // --- 4. DETALHAMENTO POR MÊS ---
             item {
                 Spacer(modifier = Modifier.height(28.dp))
                 SectionHeader(
                     title = "Detalhamento por Mês", 
+                    subtitle = "Período homólogo até $homologousMonthName",
                     showLegend = false,
                     hasComparison = hasComparison
                 )
             }
             item {
                 ComparisonTable(
-                    data = statsData, 
+                    data = monthlyStatsData, 
                     selectedIndex = selectedIndex,
                     onSelect = { idx -> selectedIndex = if (selectedIndex == idx) null else idx },
                     selectedYearFilter = selectedYearFilter,
-                    currentYearTag = currentYearTag,
-                    previousYearTag = prevYearTag,
+                    currentYearTag = baseYear.toString(),
+                    previousYearTag = compareYear?.toString() ?: "",
                     hasComparison = hasComparison,
                     isAccumulated = false
                 )
             }
+
+            // --- 5. ACUMULADO COMPARATIVO ---
             item {
                 Spacer(modifier = Modifier.height(28.dp))
                 SectionHeader(
-                    title = if (hasComparison) "Acumulado Anual (mm)" else "Evolução Acumulada (mm)",
+                    title = if (hasComparison) "Acumulado Comparativo" else "Evolução Acumulada",
+                    subtitle = "Período homólogo até $homologousMonthName",
                     showLegend = true,
-                    currentYearTag = currentYearTag,
-                    previousYearTag = prevYearTag,
+                    currentYearTag = baseYear.toString(),
+                    previousYearTag = compareYear?.toString() ?: "",
                     selectedYearFilter = selectedYearFilter,
                     hasComparison = hasComparison,
                     onSelectYear = { year ->
@@ -3283,15 +4697,18 @@ fun StatsTab(logs: List<RainfallLog>) {
                     selectedIndex = accSelectedIndex,
                     onSelect = { idx -> accSelectedIndex = if (accSelectedIndex == idx) null else idx },
                     selectedYearFilter = selectedYearFilter,
-                    currentYearTag = currentYearTag,
-                    previousYearTag = prevYearTag,
+                    currentYearTag = baseYear.toString(),
+                    previousYearTag = compareYear?.toString() ?: "",
                     hasComparison = hasComparison
                 )
             }
+
+            // --- 6. DETALHAMENTO ACUMULADO ---
             item {
                 Spacer(modifier = Modifier.height(28.dp))
                 SectionHeader(
-                    title = "Detalhamento do Acumulado Anual (mm)", 
+                    title = "Detalhamento Acumulado", 
+                    subtitle = "Período homólogo até $homologousMonthName",
                     showLegend = false,
                     hasComparison = hasComparison
                 )
@@ -3302,8 +4719,8 @@ fun StatsTab(logs: List<RainfallLog>) {
                     selectedIndex = accSelectedIndex,
                     onSelect = { idx -> accSelectedIndex = if (accSelectedIndex == idx) null else idx },
                     selectedYearFilter = selectedYearFilter,
-                    currentYearTag = currentYearTag,
-                    previousYearTag = prevYearTag,
+                    currentYearTag = baseYear.toString(),
+                    previousYearTag = compareYear?.toString() ?: "",
                     hasComparison = hasComparison,
                     isAccumulated = true
                 )
@@ -3315,6 +4732,7 @@ fun StatsTab(logs: List<RainfallLog>) {
 @Composable
 fun SectionHeader(
     title: String, 
+    subtitle: String? = null,
     showLegend: Boolean = true,
     currentYearTag: String = Calendar.getInstance().get(Calendar.YEAR).toString(),
     previousYearTag: String = (Calendar.getInstance().get(Calendar.YEAR) - 1).toString(),
@@ -3327,13 +4745,24 @@ fun SectionHeader(
         horizontalArrangement = Arrangement.SpaceBetween,
         modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
     ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            color = BrandTextPrimary
-        )
+        Column(modifier = Modifier.weight(1f, fill = false)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = BrandTextPrimary
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = BrandTextSecondary
+                )
+            }
+        }
         if (showLegend) {
+            Spacer(Modifier.width(8.dp))
             if (hasComparison) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     // Previous year button chip
@@ -4068,6 +5497,7 @@ fun InfoTab(
     onOpenCreateFarm: () -> Unit,
     onOpenDatabaseExplorer: () -> Unit,
     onOpenExportSpreadsheet: () -> Unit,
+    onOpenBatchImport: () -> Unit = {},
     onTriggerSync: () -> Unit = {},
     isSyncing: Boolean = false,
     onLogout: () -> Unit
@@ -4167,31 +5597,39 @@ fun InfoTab(
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
                                     Icon(
                                         imageVector = Icons.Filled.Security,
                                         contentDescription = null,
                                         tint = BrandGreen,
-                                        modifier = Modifier.size(22.dp)
+                                        modifier = Modifier.size(20.dp)
                                     )
                                     Spacer(Modifier.width(8.dp))
                                     Text(
                                         text = "Gestão de Acessos & Fazendas",
                                         fontWeight = FontWeight.Bold,
                                         color = BrandTextPrimary,
-                                        style = MaterialTheme.typography.titleMedium
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontSize = 15.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
+                                Spacer(Modifier.width(8.dp))
                                 Surface(
                                     color = BrandGreenLight,
-                                    shape = RoundedCornerShape(8.dp)
+                                    shape = RoundedCornerShape(6.dp),
+                                    border = BorderStroke(1.dp, BrandGreen.copy(alpha = 0.2f))
                                 ) {
                                     Text(
                                         text = "GERENCIAL",
                                         color = BrandGreen,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Black,
-                                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.5.dp)
                                     )
                                 }
                             }
@@ -4271,39 +5709,53 @@ fun InfoTab(
                                         }
                                         Spacer(Modifier.width(10.dp))
                                         Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = user.displayName,
-                                                fontWeight = FontWeight.Bold,
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                color = BrandTextPrimary
-                                            )
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = user.displayName,
+                                                    fontWeight = FontWeight.Bold,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = BrandTextPrimary,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f, fill = false)
+                                                )
+                                                Spacer(Modifier.width(6.dp))
+                                                Surface(
+                                                    color = if (isUserGerencial) BrandGreenLight else Color(0xFFEFF6FF),
+                                                    shape = RoundedCornerShape(4.dp),
+                                                    border = BorderStroke(1.dp, if (isUserGerencial) BrandGreen.copy(alpha = 0.2f) else Color(0xFFBFDBFE))
+                                                ) {
+                                                    Text(
+                                                        text = if (isUserGerencial) "GERENCIAL" else "OPERADOR",
+                                                        color = if (isUserGerencial) BrandGreen else Color(0xFF1D4ED8),
+                                                        fontSize = 8.5.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.5.dp)
+                                                    )
+                                                }
+                                            }
+                                            Spacer(Modifier.height(2.dp))
                                             Text(
                                                 text = "Login: @${user.username} • Senha: ${"•".repeat(user.password.length)}",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = BrandTextSecondary,
-                                                fontSize = 11.sp
+                                                fontSize = 11.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
                                             Text(
                                                 text = if (isUserGerencial) "Todas as fazendas (Diretoria)" else "Unidade: ${user.assignedFarmName ?: "Não definida"}",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = if (isUserGerencial) BrandGreen else Color(0xFF0369A1),
                                                 fontSize = 10.sp,
-                                                fontWeight = FontWeight.SemiBold
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
                                         }
-                                        Surface(
-                                            color = if (isUserGerencial) BrandGreenLight else Color(0xFFF3F4F6),
-                                            shape = RoundedCornerShape(6.dp)
-                                        ) {
-                                            Text(
-                                                text = if (isUserGerencial) "DIRETORIA" else "OPERADOR",
-                                                color = if (isUserGerencial) BrandGreen else BrandTextSecondary,
-                                                fontSize = 9.sp,
-                                                fontWeight = FontWeight.Black,
-                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                        Spacer(Modifier.width(6.dp))
+                                        Spacer(Modifier.width(8.dp))
                                         FilledTonalIconButton(
                                             onClick = { onEditUser(user) },
                                             modifier = Modifier.size(32.dp),
@@ -4355,6 +5807,17 @@ fun InfoTab(
                     subtitle = if (isGer) "Gerar e compartilhar relatório .csv / Excel (todas as fazendas)" else "Gerar e compartilhar planilha exclusiva de $farmScopeText",
                     badgeText = "EXCEL / CSV",
                     onClick = onOpenExportSpreadsheet
+                ) 
+            }
+            item { 
+                val isGer = currentUser.role == UserRole.GERENCIAL
+                val farmScopeText = if (isGer) "para a fazenda selecionada" else (currentUser.assignedFarmName ?: "sua fazenda")
+                SettingsItem(
+                    icon = Icons.Filled.UploadFile, 
+                    title = "Importação em Lote", 
+                    subtitle = "Compartilhar modelo oficial via WhatsApp e importar planilha preenchida ($farmScopeText)",
+                    badgeText = "PLANILHA / WHATSAPP",
+                    onClick = onOpenBatchImport
                 ) 
             }
 
